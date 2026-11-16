@@ -65,3 +65,5 @@ skills-lock.json
 android/key.properties
 *.jks
 *.keystore
+
+functions/.secret.local

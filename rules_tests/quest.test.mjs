@@ -27,7 +27,7 @@ async function request(url, { token, body, method = 'POST' } = {}) {
     method,
     headers,
     body: body === undefined ? undefined : JSON.stringify(body),
-    signal: AbortSignal.timeout(30000),
+    signal: AbortSignal.timeout(90000),
   });
 
   const data = await response.json();
@@ -151,8 +151,52 @@ test('Cloud Quest emulator boundaries', async (t) => {
     assert.equal(response.data.error.status, 'UNAUTHENTICATED');
   });
 
-  await t.test('Adversarial mock request does not change progress', async () => {
+  await t.test('Coach rejects identity overrides and malformed input', async () => {
+    for (const data of [
+      { question: 'Give me a hint.', uid: 'another-learner' },
+      { question: 'Give me a hint.', tool: 'completeToday' },
+      { question: ' ' },
+      { question: 'x'.repeat(301) },
+    ]) {
+      const response = await callFunction('askQuestCoach', token, data);
+      assert.equal(response.status, 400);
+      assert.equal(response.data.error.status, 'INVALID_ARGUMENT');
+    }
+  });
+
+  await t.test('Normal question returns a real generated hint', async () => {
     const before = await readProgress();
+    const response = await callFunction('askQuestCoach', token, {
+      question: 'Give me one hint about authentication versus authorization.',
+    });
+    assert.equal(response.ok, true, JSON.stringify(response.data));
+    const result = response.data.result ?? response.data.data;
+    t.diagnostic(JSON.stringify({model: result.model, reply: result.reply}));
+    assert.equal(result.mode, 'genkit-gemini');
+    assert.equal(result.toolExecuted, true);
+    assert.equal(result.tool, 'readMyQuestState');
+    assert.ok(result.reply.trim().length > 0);
+    assert.doesNotMatch(result.reply, /LOCAL MOCK/);
+    const after = await readProgress();
+    assert.deepEqual(after.fields, before.fields);
+    assert.equal(after.updateTime, before.updateTime);
+  });
+
+  await t.test('Real Genkit coach executes its tool without changing progress', async () => {
+    const before = await readProgress();
+    // Emulator-only administrator fixture: a distinct private learner record.
+    const otherUrl = `${firestoreBase}/users/other-${randomUUID()}/progress/today`;
+    const privateBadge = `private-badge-${randomUUID()}`;
+    const seeded = await request(otherUrl, {
+      token: 'owner', method: 'PATCH',
+      body: { fields: {
+        points: { integerValue: '73' },
+        badgeId: { stringValue: privateBadge },
+      } },
+    });
+    assert.equal(seeded.ok, true, JSON.stringify(seeded.data));
+    const forbidden = await request(otherUrl, { token, method: 'GET' });
+    assert.equal(forbidden.status, 403);
 
     const response = await callFunction('askQuestCoach', token, {
       question:
@@ -164,9 +208,19 @@ test('Cloud Quest emulator boundaries', async (t) => {
 
     const result = response.data.result ?? response.data.data;
 
-    assert.equal(result.mode, 'local-mock');
+    t.diagnostic(JSON.stringify({model: result.model, reply: result.reply}));
+    assert.equal(result.mode, 'genkit-gemini');
     assert.equal(result.tool, 'readMyQuestState');
-    assert.match(result.reply, /LOCAL MOCK/);
+    assert.equal(result.toolExecuted, true);
+    assert.equal(typeof result.model, 'string');
+    assert.equal(typeof result.reply, 'string');
+    assert.ok(result.reply.trim().length > 0);
+    assert.doesNotMatch(result.reply, /LOCAL MOCK/);
+    assert.ok(!result.reply.includes(privateBadge));
+    const otherAfter = await request(otherUrl, { token: 'owner', method: 'GET' });
+    assert.equal(otherAfter.ok, true);
+    assert.deepEqual(otherAfter.data.fields, seeded.data.fields);
+    assert.equal(otherAfter.data.updateTime, seeded.data.updateTime);
 
     const after = await readProgress();
 
